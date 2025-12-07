@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>model-viewer — debug highlight (fixed)</title>
+<script type="module" src="https://unpkg.com/@google/model-viewer/dist/model-viewer.min.js"></script>
+<style>
+body { margin: 0; font-family: Arial, Helvetica, sans-serif; }
+model-viewer { width: 100vw; height: 100vh; display: block; background: #222; }
+#panel {
+  position: absolute; left: 12px; top: 12px; z-index: 60;
+  background: rgba(255,255,255,0.96); color: #111; padding: 10px; border-radius: 8px;
+  width: 360px; max-height: 80vh; overflow:auto; box-shadow: 0 6px 20px rgba(0,0,0,0.6);
+  font-size: 13px;
+}
+.obj-row { display:flex; gap:6px; align-items:center; margin:6px 0; padding:6px; border-radius:6px; background:#f6f6f6; }
+.status { margin-left:auto; font-size:12px; }
+#dbg { position:absolute; right:12px; bottom:12px; z-index:60; color:#fff; background: rgba(0,0,0,0.5); padding:8px; border-radius:6px; }
+</style>
+</head>
+<body>
+
+<model-viewer id="viewer" src="scene.glb" camera-controls touch-action="pan-y" exposure="1" shadow-intensity="0.8"></model-viewer>
+
+<div id="panel">
+  <h3>Debug — Object_* index</h3>
+  <div id="objectsList">Loading...</div>
+  <div style="margin-top:8px;">
+    <button id="rebuild">Rebuild index</button>
+    <button id="clearHighlight">Clear highlight</button>
+    <button id="dumpIndex">Dump index → Console</button>
+  </div>
+</div>
+
+<div id="dbg">Ожидание модели...</div>
+
+<script>
+(function(){
+const viewer = document.getElementById('viewer');
+const objectsList = document.getElementById('objectsList');
+const rebuildBtn = document.getElementById('rebuild');
+const clearBtn = document.getElementById('clearHighlight');
+const dumpBtn = document.getElementById('dumpIndex');
+const dbg = document.getElementById('dbg');
+
+function lg(...a){ console.log('[mv-debug]', ...a); dbg.textContent = a.join(' '); }
+
+const state = {};
+const HIGHLIGHT_COLOR = 0xffcc33;
+const HIGHLIGHT_INT = 1.6;
+state.saved = [];
+
+/* ---------------- THREE access ---------------- */
+function getTHREE() {
+  const mats = viewer.model?.materials;
+  if (!mats?.length) return null;
+  const tex = mats[0]
+    ?.pbrMetallicRoughness
+    ?.baseColorTexture
+    ?.texture;
+  if (!tex) return null;
+  return tex.constructor; /* returns THREE namespace */
+}
+
+/* ---------------- Helpers ---------------- */
+function collectMeshes(node) {
+  const out = [];
+  function r(n){
+    if(!n) return;
+    if(n.isMesh) out.push(n);
+    if(Array.isArray(n.children)) n.children.forEach(r);
+  }
+  r(node);
+  return out;
+}
+
+function clearSaved(){
+  for(const s of state.saved){
+    if(s.mesh && s.originalMaterial) s.mesh.material = s.originalMaterial;
+    if(s.overlay && s.parent) s.parent.remove(s.overlay);
+  }
+  state.saved.length = 0;
+}
+
+function tryHighlightMaterial(mesh, THREE){
+  if(mesh.isInstancedMesh) return false;
+  const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+  const newMats = [];
+  for(const m of mats){
+    if(!m?.clone) return false;
+    const c = m.clone();
+    if(c.emissive) {
+      c.emissive.setHex(HIGHLIGHT_COLOR);
+      c.emissiveIntensity = HIGHLIGHT_INT;
+    } else if (c.color) c.color.setHex(HIGHLIGHT_COLOR);
+    newMats.push(c);
+  }
+  state.saved.push({mesh, originalMaterial: mesh.material});
+  mesh.material = Array.isArray(mesh.material) ? newMats : newMats[0];
+  return true;
+}
+
+function createOverlay(mesh, THREE){
+  const geom = mesh.geometry.clone?.() || mesh.geometry;
+  const mat = new THREE.MeshBasicMaterial({color:HIGHLIGHT_COLOR, transparent:true, opacity:0.85, depthTest:false});
+  const ov = new THREE.Mesh(geom, mat);
+  ov.matrix.copy(mesh.matrixWorld);
+  ov.matrixAutoUpdate = false;
+  ov.renderOrder = 9999;
+  if(mesh.parent) {
+    mesh.parent.add(ov);
+    state.saved.push({overlay:ov, parent:mesh.parent});
+    return ov;
+  }
+  return null;
+}
+
+function highlightMesh(mesh, THREE){
+  clearSaved();
+  if(!tryHighlightMaterial(mesh, THREE)) createOverlay(mesh, THREE);
+  lg("highlight:", mesh.name);
+}
+
+/* ---------------- Index builder ---------------- */
+state.index = [];
+
+function buildIndex(){
+  state.index = [];
+  const root = viewer.model?.scene;
+  if(!root){ lg("model not ready"); return; }
+
+  const stack = [root];
+  while(stack.length){
+    const n = stack.pop();
+    if(/^Object_\d+$/.test(n.name)){
+      const meshes = collectMeshes(n);
+      state.index.push({name:n.name, node:n, meshes});
+    }
+    if(n.children) stack.push(...n.children);
+  }
+
+  renderPanel();
+  lg("Indexed:", state.index.length);
+}
+
+/* ---------------- Panel ---------------- */
+function renderPanel(){
+  objectsList.innerHTML = '';
+  if(!state.index.length){
+    objectsList.textContent = "no Object_* found";
+    return;
+  }
+  state.index.forEach((it,i)=>{
+    const row = document.createElement('div'); row.className = 'obj-row';
+    const b = document.createElement('button'); b.textContent = it.name;
+    b.onclick = ()=>selectByIndex(i);
+    const info = document.createElement('span');
+    info.textContent = "meshes: " + it.meshes.length;
+    const st = document.createElement('span'); st.className='status'; st.textContent='idle';
+    row.append(b, info, st);
+    objectsList.append(row);
+    it._dom = {row, st};
+  });
+}
+
+/* ---------------- Selection ---------------- */
+function selectByIndex(i){
+  const it = state.index[i];
+  if(!it) return;
+  const t = it.meshes[0];
+  if(!t) return;
+  const THREE = getTHREE();
+  highlightMesh(t, THREE);
+  updatePanelHighlight(t);
+}
+
+function updatePanelHighlight(mesh){
+  state.index.forEach(it=>{
+    if(it._dom){
+      if(it.meshes[0] === mesh){
+        it._dom.st.textContent = 'highlighted';
+        it._dom.st.style.color = 'green';
+      } else {
+        it._dom.st.textContent = 'idle';
+        it._dom.st.style.color = '';
+      }
+    }
+  });
+}
+
+function findIndexItemForMesh(mesh){
+  for(const it of state.index){
+    if(it.meshes.includes(mesh)) return it;
+  }
+  return null;
+}
+
+/* ---------------- CLICK ---------------- */
+viewer.addEventListener('click', ev => {
+  const THREE = getTHREE();
+  if (!THREE) { lg("THREE unavailable"); return; }
+
+  const scene3 = viewer.model.scene;
+  const cam3 = viewer.getCamera();
+
+  const rect = viewer.getBoundingClientRect();
+  const x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
+  const y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
+
+  const mouse = new THREE.Vector2(x,y);
+  const ray = new THREE.Raycaster();
+  ray.setFromCamera(mouse, cam3);
+
+  const hits = ray.intersectObjects(scene3.children, true);
+  if(!hits.length){ clearSaved(); lg("no hit"); return; }
+
+  let mesh = hits[0].object;
+  while(mesh && !mesh.isMesh) mesh = mesh.parent;
+
+  const idx = findIndexItemForMesh(mesh);
+  const target = idx ? idx.meshes[0] : mesh;
+
+  highlightMesh(target, THREE);
+  updatePanelHighlight(target);
+
+  lg("clicked:", target.name);
+});
+
+/* ---------------- UI ---------------- */
+rebuildBtn.onclick = buildIndex;
+clearBtn.onclick = clearSaved;
+dumpBtn.onclick = ()=>console.log("index dump", state.index);
+
+viewer.addEventListener('load', ()=>{
+  lg("model loaded — building index...");
+  setTimeout(buildIndex, 200);
+});
+})();
+</script>
+
+</body>
+</html>
